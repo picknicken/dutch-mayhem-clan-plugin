@@ -1,4 +1,4 @@
-package com.dmcbot;
+package com.eventbridge;
 
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
@@ -9,6 +9,7 @@ import net.runelite.api.Actor;
 import net.runelite.api.ChatMessageType;
 import net.runelite.api.Client;
 import net.runelite.api.GameState;
+import net.runelite.api.NPC;
 import net.runelite.api.Player;
 import net.runelite.api.WorldType;
 import net.runelite.api.coords.WorldArea;
@@ -24,18 +25,26 @@ import net.runelite.client.config.ConfigManager;
 import net.runelite.client.eventbus.Subscribe;
 import net.runelite.client.events.NpcLootReceived;
 import net.runelite.client.events.PlayerLootReceived;
-import net.runelite.client.plugins.loottracker.LootReceived;
 import net.runelite.client.game.ItemManager;
 import net.runelite.client.game.ItemStack;
 import net.runelite.client.plugins.Plugin;
 import net.runelite.client.plugins.PluginDescriptor;
+import net.runelite.client.plugins.loottracker.LootReceived;
 import net.runelite.client.util.Text;
-import okhttp3.*;
+import okhttp3.Call;
+import okhttp3.Callback;
+import okhttp3.HttpUrl;
+import okhttp3.MediaType;
+import okhttp3.OkHttpClient;
+import okhttp3.Request;
+import okhttp3.RequestBody;
+import okhttp3.Response;
 
 import java.io.IOException;
 import java.util.Collection;
 import java.util.EnumSet;
 import java.util.HashMap;
+import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.ConcurrentLinkedDeque;
 import java.util.regex.Matcher;
@@ -44,17 +53,17 @@ import java.util.regex.Pattern;
 
 @Slf4j
 @PluginDescriptor(
-		name = "Dutch Mayhem Clan",
-		description = "Dutch Mayhem Clan companion: clan chat mirror to Discord, wilderness/PvP loot-split tracking and clan bingo events.",
-		tags = {"discord", "clan", "chat", "bot", "wilderness", "loot", "split", "dmc", "dutch mayhem clan", "bingo", "pvp", "pk"}
+		name = "Event Bridge",
+		description = "Sends in-game events as structured JSON to an HTTP endpoint you configure.",
+		tags = {"webhook", "api", "events", "discord", "json", "bridge", "loot", "pvp", "clan"}
 )
-public class DiscordCCPlugin extends Plugin
+public class EventBridgePlugin extends Plugin
 {
 	@Inject
 	private Client client;
 
 	@Inject
-	private DiscordCCConfig config;
+	private EventBridgeConfig config;
 
 	@Inject
 	private OkHttpClient okHttpClient;
@@ -64,10 +73,31 @@ public class DiscordCCPlugin extends Plugin
 
 	private static final MediaType JSON = MediaType.parse("application/json; charset=utf-8");
 
-	/** Payload format version — lets the server distinguish old/new plugin builds. */
-	private static final String PLUGIN_VERSION = "2.0.0";
+	/** Plugin version sent with every event. Must match {@code version} in build.gradle. */
+	static final String PLUGIN_VERSION = "3.0.0";
 
-	// ── Bingo event tracking state ────────────────────────────────────────────
+	/**
+	 * Envelope schema version. Bumped only on a breaking change to the envelope
+	 * or to an existing {@code data} shape; new event types or optional fields
+	 * do not bump it.
+	 */
+	static final int SCHEMA_VERSION = 1;
+
+	// ── Event types ───────────────────────────────────────────────────────────
+
+	static final String TYPE_CLAN_CHAT = "CLAN_CHAT";
+	static final String TYPE_QUEST_COMPLETED = "QUEST_COMPLETED";
+	static final String TYPE_COLLECTION_LOG = "COLLECTION_LOG";
+	static final String TYPE_COMBAT_ACHIEVEMENT = "COMBAT_ACHIEVEMENT";
+	static final String TYPE_CLUE_COMPLETED = "CLUE_COMPLETED";
+	static final String TYPE_ACHIEVEMENT_DIARY = "ACHIEVEMENT_DIARY";
+	static final String TYPE_LEVEL_UP = "LEVEL_UP";
+	static final String TYPE_XP_MILESTONE = "XP_MILESTONE";
+	static final String TYPE_LOOT = "LOOT";
+	static final String TYPE_PLAYER_KILL = "PLAYER_KILL";
+	static final String TYPE_DEATH = "DEATH";
+
+	// ── Level / XP tracking state ─────────────────────────────────────────────
 
 	/** Last known level per skill — used to detect level-ups. */
 	private final Map<String, Integer> lastLevels = new HashMap<>();
@@ -76,9 +106,8 @@ public class DiscordCCPlugin extends Plugin
 	private final Map<String, Integer> lastXpBoundary = new HashMap<>();
 
 	/**
-	 * How often to report XP for 99+ skills.
-	 * We fire once per 100k XP gained so the bot can check XP-milestone bingo tiles
-	 * without flooding the server on every single action.
+	 * How often to report XP for 99+ skills: once per 100k XP gained, so
+	 * receivers can track XP goals without an event for every single action.
 	 */
 	private static final int XP_SEND_THRESHOLD = 100_000;
 
@@ -109,7 +138,7 @@ public class DiscordCCPlugin extends Plugin
 	// A player's death within ATTACKER_TIMEOUT_TICKS of our last hit counts as
 	// our kill — the reliable signal for loot-key kills, which emit no personal
 	// "You have defeated X!" game message. The damage total is sent with the
-	// kill so the server can credit the top-damage attacker in a multi-way pile.
+	// kill so a receiver can credit the top-damage attacker in a multi-way pile.
 	private static final class DamageDealt
 	{
 		int total;
@@ -125,11 +154,11 @@ public class DiscordCCPlugin extends Plugin
 
 	private static final class PendingPost
 	{
-		final String url;
+		final HttpUrl url;
 		final JsonObject payload;
 		final int attempt;
 
-		PendingPost(String url, JsonObject payload, int attempt)
+		PendingPost(HttpUrl url, JsonObject payload, int attempt)
 		{
 			this.url = url;
 			this.payload = payload;
@@ -138,6 +167,12 @@ public class DiscordCCPlugin extends Plugin
 	}
 
 	private final ConcurrentLinkedDeque<PendingPost> retryQueue = new ConcurrentLinkedDeque<>();
+
+	/** Last invalid endpoint value we warned about, so each bad value is logged once. */
+	private String lastInvalidEndpoint;
+
+	/** Set once we warned that the auth token cannot be used as a header value. */
+	private boolean warnedInvalidToken;
 
 	// ── Game message patterns ─────────────────────────────────────────────────
 
@@ -167,9 +202,9 @@ public class DiscordCCPlugin extends Plugin
 	// ── Config ────────────────────────────────────────────────────────────────
 
 	@Provides
-	DiscordCCConfig provideConfig(ConfigManager configManager)
+	EventBridgeConfig provideConfig(ConfigManager configManager)
 	{
-		return configManager.getConfig(DiscordCCConfig.class);
+		return configManager.getConfig(EventBridgeConfig.class);
 	}
 
 	@Override
@@ -182,6 +217,8 @@ public class DiscordCCPlugin extends Plugin
 		lastAttackerTick = -1;
 		lastTargeterName = null;
 		damagedPlayers.clear();
+		lastInvalidEndpoint = null;
+		warnedInvalidToken = false;
 	}
 
 	// ── Login/logout state ────────────────────────────────────────────────────
@@ -227,105 +264,85 @@ public class DiscordCCPlugin extends Plugin
 	{
 		ChatMessageType type = event.getType();
 
-		// Clan chat forwarding (unchanged behaviour)
 		if (type == ChatMessageType.CLAN_CHAT || type == ChatMessageType.CLAN_MESSAGE)
 		{
-			String message = event.getMessage();
-			if (!message.startsWith("To talk in your clan"))
-			{
-				String senderName = Text.removeTags(event.getName());
-				sendToPythonServer(senderName, message);
-			}
+			handleClanChat(event, type == ChatMessageType.CLAN_MESSAGE);
 		}
 
-		// Personal game messages — bingo-relevant events. PK kills are
-		// detected from the victim's death (onActorDeath), not a chat
-		// message: loot-key kills emit no "You have defeated X!" line.
-		if (type == ChatMessageType.GAMEMESSAGE)
+		// Personal game messages — achievements. PK kills are detected from the
+		// victim's death (onActorDeath), not a chat message: loot-key kills
+		// emit no "You have defeated X!" line.
+		if (type == ChatMessageType.GAMEMESSAGE && config.sendAchievements())
 		{
-			handleBingoGameMessage(event.getMessage());
+			handleAchievementMessage(event.getMessage());
 		}
 	}
 
-	private void handleBingoGameMessage(String rawMessage)
+	private void handleClanChat(ChatMessage event, boolean system)
 	{
-		if (!isConfigured()) return;
+		if (!config.sendClanChat()) return;
 
-		String rsn = getLocalRsn();
-		if (rsn == null) return;
+		String message = Text.removeTags(event.getMessage());
+		if (message.startsWith("To talk in your clan")) return;
 
+		String sender = event.getName() == null ? "" : Text.removeTags(event.getName());
+
+		JsonObject data = new JsonObject();
+		data.addProperty("sender", sender);
+		data.addProperty("message", message);
+		data.addProperty("system", system);
+		send(TYPE_CLAN_CHAT, data);
+	}
+
+	private void handleAchievementMessage(String rawMessage)
+	{
 		String msg = Text.removeTags(rawMessage);
-		JsonObject payload = null;
 		Matcher m;
 
-		// Quest completion
 		m = QUEST_PATTERN.matcher(msg);
 		if (m.find())
 		{
-			payload = new JsonObject();
-			payload.addProperty("rsn",  rsn);
-			payload.addProperty("type", "quest");
-			payload.addProperty("name", m.group(1).trim());
+			JsonObject data = new JsonObject();
+			data.addProperty("quest", m.group(1).trim());
+			send(TYPE_QUEST_COMPLETED, data);
+			return;
 		}
 
-		// Collection log (new entry)
-		if (payload == null)
+		m = CLOG_PATTERN.matcher(msg);
+		if (m.find())
 		{
-			m = CLOG_PATTERN.matcher(msg);
-			if (m.find())
-			{
-				payload = new JsonObject();
-				payload.addProperty("rsn",  rsn);
-				payload.addProperty("type", "collection_log");
-				payload.addProperty("item", m.group(1).trim());
-			}
+			JsonObject data = new JsonObject();
+			data.addProperty("item", m.group(1).trim());
+			send(TYPE_COLLECTION_LOG, data);
+			return;
 		}
 
-		// Combat achievement
-		if (payload == null)
+		m = CA_PATTERN.matcher(msg);
+		if (m.find())
 		{
-			m = CA_PATTERN.matcher(msg);
-			if (m.find())
-			{
-				payload = new JsonObject();
-				payload.addProperty("rsn",  rsn);
-				payload.addProperty("type", "combat_achievement");
-				payload.addProperty("tier", m.group(1));
-				payload.addProperty("task", m.group(2).trim());
-			}
+			JsonObject data = new JsonObject();
+			data.addProperty("tier", m.group(1).toLowerCase(Locale.ROOT));
+			data.addProperty("task", m.group(2).trim());
+			send(TYPE_COMBAT_ACHIEVEMENT, data);
+			return;
 		}
 
-		// Clue scroll completion
-		if (payload == null)
+		m = CLUE_PATTERN.matcher(msg);
+		if (m.find())
 		{
-			m = CLUE_PATTERN.matcher(msg);
-			if (m.find())
-			{
-				payload = new JsonObject();
-				payload.addProperty("rsn",        rsn);
-				payload.addProperty("type",       "clue_completion");
-				payload.addProperty("difficulty", m.group(1).toLowerCase());
-			}
+			JsonObject data = new JsonObject();
+			data.addProperty("tier", m.group(1).toLowerCase(Locale.ROOT));
+			send(TYPE_CLUE_COMPLETED, data);
+			return;
 		}
 
-		// Achievement diary
-		if (payload == null)
+		m = DIARY_PATTERN.matcher(msg);
+		if (m.find())
 		{
-			m = DIARY_PATTERN.matcher(msg);
-			if (m.find())
-			{
-				payload = new JsonObject();
-				payload.addProperty("rsn",    rsn);
-				payload.addProperty("type",   "diary");
-				payload.addProperty("tier",   m.group(1));
-				// Match the bot's region naming (tiles store "<area> Diary", e.g. "Varrock Diary")
-				payload.addProperty("region", m.group(2).trim() + " Diary");
-			}
-		}
-
-		if (payload != null)
-		{
-			sendBingoEvent(payload);
+			JsonObject data = new JsonObject();
+			data.addProperty("tier", m.group(1).toLowerCase(Locale.ROOT));
+			data.addProperty("area", m.group(2).trim());
+			send(TYPE_ACHIEVEMENT_DIARY, data);
 		}
 	}
 
@@ -334,17 +351,14 @@ public class DiscordCCPlugin extends Plugin
 	@Subscribe
 	public void onStatChanged(StatChanged event)
 	{
-		if (!isConfigured()) return;
-
-		String rsn = getLocalRsn();
-		if (rsn == null) return;
-
 		String skillName = event.getSkill().getName();
 		int    newLevel  = event.getLevel();
 		int    newXp     = event.getXp();
 
 		// Inside the login grace window (and while not fully logged in) events
 		// only seed/refresh the maps — no sends. This kills the login burst.
+		// The maps are always kept current, so turning the toggle on later
+		// does not produce a burst of stale level-ups either.
 		boolean suppress = ticksSinceLogin < LOGIN_GRACE_TICKS
 				|| client.getGameState() != GameState.LOGGED_IN;
 
@@ -360,18 +374,18 @@ public class DiscordCCPlugin extends Plugin
 			{
 				lastLevels.put(skillName, newLevel);
 
-				JsonObject payload = new JsonObject();
-				payload.addProperty("rsn",   rsn);
-				payload.addProperty("type",  "level_up");
-				payload.addProperty("skill", skillName);
-				payload.addProperty("level", newLevel);
-				payload.addProperty("xp",    newXp);
-				sendBingoEvent(payload);
+				if (config.sendLevels())
+				{
+					JsonObject data = new JsonObject();
+					data.addProperty("skill", skillName);
+					data.addProperty("level", newLevel);
+					data.addProperty("xp",    newXp);
+					send(TYPE_LEVEL_UP, data);
+				}
 			}
 		}
 
-		// XP milestone reporting for 99+ skills
-		// Send once per XP_SEND_THRESHOLD gained so the bot can detect dynamic XP-target tiles.
+		// XP milestones for 99+ skills: once per XP_SEND_THRESHOLD gained.
 		if (newLevel >= 99)
 		{
 			int boundary = newXp / XP_SEND_THRESHOLD;
@@ -384,57 +398,103 @@ public class DiscordCCPlugin extends Plugin
 			{
 				lastXpBoundary.put(skillName, boundary);
 
-				JsonObject payload = new JsonObject();
-				payload.addProperty("rsn",   rsn);
-				payload.addProperty("type",  "xp_milestone");
-				payload.addProperty("skill", skillName);
-				payload.addProperty("xp",    newXp);
-				sendBingoEvent(payload);
+				if (config.sendLevels())
+				{
+					JsonObject data = new JsonObject();
+					data.addProperty("skill", skillName);
+					data.addProperty("xp",    newXp);
+					send(TYPE_XP_MILESTONE, data);
+				}
 			}
 		}
 	}
 
-	// ── NPC / Player loot ─────────────────────────────────────────────────────
+	// ── Loot ──────────────────────────────────────────────────────────────────
 
 	@Subscribe
 	public void onNpcLootReceived(NpcLootReceived event)
 	{
-		// NPC loot is no longer part of the wildy split-tracker (PvP only).
-		// Bingo drop tracking — all NPC drops regardless of location.
-		sendBingoDrops(event.getItems());
+		JsonObject source = new JsonObject();
+		source.addProperty("type", "NPC");
+		NPC npc = event.getNpc();
+		if (npc != null)
+		{
+			if (npc.getName() != null)
+			{
+				source.addProperty("name", Text.removeTags(npc.getName()));
+			}
+			source.addProperty("id", npc.getId());
+		}
+		sendLoot(source, event.getItems());
 	}
 
 	@Subscribe
 	public void onPlayerLootReceived(PlayerLootReceived event)
 	{
-		// Wilderness + PvP/Deadman worlds (whole world is a PvP zone there)
-		if (!isPvpEnvironment())
+		JsonObject source = new JsonObject();
+		source.addProperty("type", "PLAYER");
+		Player victim = event.getPlayer();
+		if (victim != null && victim.getName() != null)
 		{
-			return;
+			String name = Text.removeTags(victim.getName());
+			if (!name.isEmpty())
+			{
+				source.addProperty("name", name);
+			}
 		}
-
-		String victim = event.getPlayer() != null
-				? Text.removeTags(event.getPlayer().getName())
-				: null;
-
-		sendWildyLootItems(event.getItems(), false, victim);
+		sendLoot(source, event.getItems());
 	}
 
 	@Subscribe
 	public void onLootReceived(LootReceived event)
 	{
-		// Wilderness loot keys deposit their actual contents into a chest
-		// outside the wilderness, so this path intentionally skips isPvpEnvironment().
-		String source = event.getName();
-		if (source == null) return;
+		// Wilderness loot keys are opened at a chest outside the wilderness;
+		// the loot tracker reports the contents under the name "Loot Chest".
+		String name = event.getName();
+		if (name == null || !name.equalsIgnoreCase("Loot Chest")) return;
 
-		if (source.equalsIgnoreCase("Loot Chest"))
-		{
-			sendWildyLootItems(event.getItems(), true, null);
-		}
+		JsonObject source = new JsonObject();
+		source.addProperty("type", "LOOT_KEY");
+		sendLoot(source, event.getItems());
 	}
 
-	// ── Deaths ────────────────────────────────────────────────────────────────
+	/** One LOOT event per loot drop, with every item in it. */
+	private void sendLoot(JsonObject source, Collection<ItemStack> items)
+	{
+		if (!config.sendLoot() || resolveEndpoint() == null) return;
+
+		JsonArray itemsArray = new JsonArray();
+		long totalValue = 0;
+
+		for (ItemStack item : items)
+		{
+			int    itemId   = item.getId();
+			int    quantity = item.getQuantity();
+			String itemName = itemManager.getItemComposition(itemId).getName();
+			long   gePrice  = itemManager.getItemPrice(itemId);
+
+			JsonObject entry = new JsonObject();
+			entry.addProperty("id",       itemId);
+			entry.addProperty("name",     itemName);
+			entry.addProperty("quantity", quantity);
+			entry.addProperty("gePrice",  gePrice);
+			itemsArray.add(entry);
+
+			totalValue += gePrice * quantity;
+		}
+
+		if (itemsArray.size() == 0) return;
+		if (totalValue < config.minLootValue()) return;
+
+		JsonObject data = new JsonObject();
+		data.add("source", source);
+		data.add("items", itemsArray);
+		data.addProperty("totalValue", totalValue);
+		data.addProperty("pvpArea", isPvpArea());
+		send(TYPE_LOOT, data);
+	}
+
+	// ── Kills and deaths ──────────────────────────────────────────────────────
 
 	@Subscribe
 	public void onInteractingChanged(InteractingChanged event)
@@ -510,10 +570,7 @@ public class DiscordCCPlugin extends Plugin
 		}
 
 		if (actor != client.getLocalPlayer()) return;
-		if (!isConfigured() || !isPvpEnvironment()) return;
-
-		String rsn = getLocalRsn();
-		if (rsn == null) return;
+		if (!config.sendPvp()) return;
 
 		// Recent damage-dealer first; fallback: whoever we were interacting with
 		String killer = null;
@@ -531,28 +588,23 @@ public class DiscordCCPlugin extends Plugin
 			}
 		}
 
-		JsonObject payload = new JsonObject();
-		payload.addProperty("rsn", rsn);
+		JsonObject data = new JsonObject();
 		if (killer != null && !killer.isEmpty())
 		{
-			payload.addProperty("killer", killer);
+			data.addProperty("killer", killer);
 		}
-		addPosition(payload);
-		postJson(config.serverUrl() + "/api/wildy-death", payload);
+		data.addProperty("pvpArea", isPvpArea());
+		send(TYPE_DEATH, data);
 	}
 
 	/**
 	 * A nearby player died — attribute it to us only if we dealt them damage
 	 * within ATTACKER_TIMEOUT_TICKS. Works for loot-key kills (no "defeated"
-	 * message) and plots at the victim's tile, i.e. the actual kill spot.
+	 * message); the location is the victim's tile, i.e. the actual kill spot.
 	 */
 	private void handlePotentialKill(Player victim)
 	{
-		if (!isConfigured() || !isPvpEnvironment()) return;
 		if (victim.getName() == null) return;
-
-		String rsn = getLocalRsn();
-		if (rsn == null) return;
 
 		String victimName = Text.removeTags(victim.getName());
 		DamageDealt dealt = damagedPlayers.remove(victimName);
@@ -561,12 +613,13 @@ public class DiscordCCPlugin extends Plugin
 			return; // we did not (recently) damage them — not our kill
 		}
 
-		JsonObject payload = new JsonObject();
-		payload.addProperty("rsn",    rsn);
-		payload.addProperty("victim", victimName);
-		payload.addProperty("damage", dealt.total);
-		addPosition(payload, victim);
-		postJson(config.serverUrl() + "/api/wildy-kill", payload);
+		if (!config.sendPvp()) return;
+
+		JsonObject data = new JsonObject();
+		data.addProperty("victim",  victimName);
+		data.addProperty("damage",  dealt.total);
+		data.addProperty("pvpArea", isPvpArea());
+		send(TYPE_PLAYER_KILL, data, victim);
 	}
 
 	// ── Location helpers ──────────────────────────────────────────────────────
@@ -590,194 +643,157 @@ public class DiscordCCPlugin extends Plugin
 		return types.contains(WorldType.PVP) || types.contains(WorldType.DEADMAN);
 	}
 
-	private boolean isPvpEnvironment()
+	/** True in the Wilderness or anywhere on a PvP/Deadman world. */
+	private boolean isPvpArea()
 	{
 		return isInWilderness() || isPvpWorld();
 	}
 
-	/** Adds our own position — used for deaths. */
-	private void addPosition(JsonObject payload)
+	// ── Envelope ──────────────────────────────────────────────────────────────
+
+	/** Sends an event located at the local player's position. */
+	private void send(String type, JsonObject data)
 	{
-		addPosition(payload, client.getLocalPlayer());
+		send(type, data, client.getLocalPlayer());
 	}
 
-	/** Adds the given actor's position, world and client timestamp to a payload. */
-	private void addPosition(JsonObject payload, Actor actor)
+	/**
+	 * Wraps {@code data} in the envelope and posts it. Does nothing while no
+	 * valid endpoint is configured or the local player's name is unknown.
+	 *
+	 * @param locationActor actor whose position goes in {@code location}
+	 */
+	private void send(String type, JsonObject data, Actor locationActor)
 	{
-		if (actor != null)
+		HttpUrl url = resolveEndpoint();
+		if (url == null) return;
+
+		String playerName = getLocalPlayerName();
+		if (playerName == null) return;
+
+		JsonObject player = new JsonObject();
+		player.addProperty("name", playerName);
+		player.addProperty("world", client.getWorld());
+
+		JsonObject envelope = new JsonObject();
+		envelope.addProperty("schema", SCHEMA_VERSION);
+		envelope.addProperty("pluginVersion", PLUGIN_VERSION);
+		envelope.addProperty("type", type);
+		envelope.addProperty("timestamp", System.currentTimeMillis());
+		envelope.add("player", player);
+
+		WorldPoint loc = locationActor != null ? locationActor.getWorldLocation() : null;
+		if (loc != null)
 		{
-			WorldPoint loc = actor.getWorldLocation();
-			payload.addProperty("x",     loc.getX());
-			payload.addProperty("y",     loc.getY());
-			payload.addProperty("plane", loc.getPlane());
+			JsonObject location = new JsonObject();
+			location.addProperty("x",     loc.getX());
+			location.addProperty("y",     loc.getY());
+			location.addProperty("plane", loc.getPlane());
+			envelope.add("location", location);
 		}
-		payload.addProperty("world", client.getWorld());
-		payload.addProperty("ts",    System.currentTimeMillis());
+
+		envelope.add("data", data);
+
+		postJson(url, envelope, 0);
 	}
 
-	// ── Senders ───────────────────────────────────────────────────────────────
-
-	private void sendWildyLootItems(Collection<ItemStack> items, boolean keyed, String victim)
+	private String getLocalPlayerName()
 	{
-		if (!isConfigured())
-		{
-			return;
-		}
-
-		String rsn = getLocalRsn();
-		if (rsn == null)
-		{
-			return;
-		}
-
-		JsonArray itemsArray = new JsonArray();
-
-		for (ItemStack item : items)
-		{
-			int    itemId   = item.getId();
-			int    quantity = item.getQuantity();
-			String itemName = itemManager.getItemComposition(itemId).getName();
-			int    gePrice  = itemManager.getItemPrice(itemId);
-
-			JsonObject entry = new JsonObject();
-			entry.addProperty("itemId",   itemId);
-			entry.addProperty("itemName", itemName);
-			entry.addProperty("quantity", quantity);
-			entry.addProperty("gePrice",  gePrice);
-			itemsArray.add(entry);
-		}
-
-		if (itemsArray.size() == 0)
-		{
-			return;
-		}
-
-		JsonObject payload = new JsonObject();
-		payload.addProperty("rsn",      rsn);
-		payload.addProperty("lootType", "PLAYER");
-		payload.addProperty("keyed",    keyed);
-		if (victim != null && !victim.isEmpty())
-		{
-			payload.addProperty("victim", victim);
-		}
-		addPosition(payload);
-		payload.add("items", itemsArray);
-
-		postJson(config.serverUrl() + "/api/wildy-loot", payload);
-	}
-
-	/** One batched request per loot event instead of one request per item. */
-	private void sendBingoDrops(Collection<ItemStack> items)
-	{
-		if (!isConfigured()) return;
-
-		String rsn = getLocalRsn();
-		if (rsn == null) return;
-
-		JsonArray itemsArray = new JsonArray();
-
-		for (ItemStack item : items)
-		{
-			int    itemId   = item.getId();
-			int    quantity = item.getQuantity();
-			String itemName = itemManager.getItemComposition(itemId).getName();
-			int    gePrice  = itemManager.getItemPrice(itemId);
-
-			JsonObject entry = new JsonObject();
-			entry.addProperty("item",     itemName);
-			entry.addProperty("quantity", quantity);
-			entry.addProperty("coins",    (long) gePrice * quantity);
-			itemsArray.add(entry);
-		}
-
-		if (itemsArray.size() == 0) return;
-
-		JsonObject payload = new JsonObject();
-		payload.addProperty("rsn",  rsn);
-		payload.addProperty("type", "drop_batch");
-		payload.add("items", itemsArray);
-		sendBingoEvent(payload);
-	}
-
-	// ── Shared helpers ────────────────────────────────────────────────────────
-
-	private void sendToPythonServer(String playerName, String message)
-	{
-		if (!isConfigured())
-		{
-			return;
-		}
-
-		JsonObject payload = new JsonObject();
-		payload.addProperty("playerName", playerName);
-		payload.addProperty("message", message);
-
-		postJson(config.serverUrl() + "/api/chat", payload);
-	}
-
-	private void sendBingoEvent(JsonObject payload)
-	{
-		postJson(config.serverUrl() + "/api/bingo-event", payload);
-	}
-
-	private boolean isConfigured()
-	{
-		return config.serverUrl() != null && !config.serverUrl().isEmpty()
-				&& config.secretToken() != null && !config.secretToken().isEmpty();
-	}
-
-	private String getLocalRsn()
-	{
-		if (client.getLocalPlayer() == null)
+		if (client.getLocalPlayer() == null || client.getLocalPlayer().getName() == null)
 		{
 			return null;
 		}
-		String rsn = Text.removeTags(client.getLocalPlayer().getName());
-		return rsn.isEmpty() ? null : rsn;
+		String name = Text.removeTags(client.getLocalPlayer().getName());
+		return name.isEmpty() ? null : name;
 	}
 
-	private void postJson(String url, JsonObject payload)
+	// ── Transport ─────────────────────────────────────────────────────────────
+
+	/**
+	 * The configured endpoint, or null when it is empty or not a valid
+	 * http(s) URL. An invalid value is logged once; this never throws.
+	 */
+	private HttpUrl resolveEndpoint()
 	{
-		postJson(url, payload, 0);
+		String raw = config.endpointUrl();
+		if (raw == null || raw.trim().isEmpty())
+		{
+			return null;
+		}
+		raw = raw.trim();
+
+		HttpUrl url = HttpUrl.parse(raw);
+		if (url == null || !(url.scheme().equals("http") || url.scheme().equals("https")))
+		{
+			if (!raw.equals(lastInvalidEndpoint))
+			{
+				lastInvalidEndpoint = raw;
+				log.warn("Event Bridge: the endpoint URL is not a valid http(s) URL; no events are sent");
+			}
+			return null;
+		}
+		return url;
 	}
 
-	private void postJson(String url, JsonObject payload, int attempt)
+	private void postJson(HttpUrl url, JsonObject payload, int attempt)
 	{
-		payload.addProperty("plugin_version", PLUGIN_VERSION);
+		Request request;
+		try
+		{
+			Request.Builder builder = new Request.Builder()
+					.url(url)
+					.post(RequestBody.create(JSON, payload.toString()));
 
-		RequestBody body    = RequestBody.create(JSON, payload.toString());
-		Request     request = new Request.Builder()
-				.url(url)
-				.addHeader("Authorization", config.secretToken())
-				.post(body)
-				.build();
+			String token = config.authToken();
+			if (token != null && !token.trim().isEmpty())
+			{
+				builder.header("Authorization", "Bearer " + token.trim());
+			}
+			request = builder.build();
+		}
+		catch (IllegalArgumentException e)
+		{
+			// OkHttp rejects header values with control or non-ASCII characters.
+			if (!warnedInvalidToken)
+			{
+				warnedInvalidToken = true;
+				log.warn("Event Bridge: the auth token contains characters that cannot be sent in a header; no events are sent");
+			}
+			return;
+		}
 
 		okHttpClient.newCall(request).enqueue(new Callback()
 		{
 			@Override
 			public void onFailure(Call call, IOException e)
 			{
-				// Network failure only (auth/4xx responses land in onResponse and
-				// are never retried). Requeue with backoff via the game-tick drain.
+				// Network failure only (non-2xx responses land in onResponse and
+				// are never retried). Requeue; the game-tick drain resends at most
+				// RETRIES_PER_TICK per tick, with no growing delay between attempts.
 				if (attempt < MAX_RETRIES && retryQueue.size() < MAX_RETRY_QUEUE)
 				{
 					retryQueue.add(new PendingPost(url, payload, attempt + 1));
 				}
 				else
 				{
-					log.warn("Failed to POST to {} (giving up): {}", url, e.getMessage());
+					log.warn("Event Bridge: failed to POST to {} (giving up): {}", url.host(), e.getMessage());
 				}
 			}
 
 			@Override
-			public void onResponse(Call call, Response response) throws IOException
+			public void onResponse(Call call, Response response)
 			{
+				if (!response.isSuccessful())
+				{
+					log.debug("Event Bridge: {} responded {} to a {} event",
+							url.host(), response.code(), payload.get("type").getAsString());
+				}
 				response.close();
 			}
 		});
 	}
 
-	/** Drains a couple of failed POSTs per game tick (~0.6s spacing). */
+	/** Resends a couple of failed POSTs per game tick (~0.6s spacing). */
 	private void flushRetryQueue()
 	{
 		for (int i = 0; i < RETRIES_PER_TICK; i++)

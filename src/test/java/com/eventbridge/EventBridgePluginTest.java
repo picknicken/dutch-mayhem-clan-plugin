@@ -1,13 +1,13 @@
-package com.dmcbot;
+package com.eventbridge;
 
 import net.runelite.client.RuneLite;
 import net.runelite.client.externalplugins.ExternalPluginManager;
 
-public class DiscordCCPluginTest
+public class EventBridgePluginTest
 {
 	public static void main(String[] args) throws Exception
 	{
-		ExternalPluginManager.loadBuiltin(DiscordCCPlugin.class);
+		ExternalPluginManager.loadBuiltin(EventBridgePlugin.class);
 		RuneLite.main(args);
 	}
 }
